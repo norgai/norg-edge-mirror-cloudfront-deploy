@@ -1,10 +1,7 @@
 {
-  "version": "0.6.14",
   "gate_version": "0.1.1",
   "algorithm": "sha256",
   "files": {
-    "edge-router-lambda.cjs": "5d0a4030c68df482bceeebff2ee0fa9b151c662291829864c0a1a822438da355",
-    "heartbeat-lambda.cjs": "e4a36a7b1eab0aa243a1f7af3cad756d8660a7eec1a7b19d297c44041a03a18d",
     "edge-gate.js": "fdc9928d52de0ea5a212965b0fc22ad87ea4ab48df62c0a48f10f9f5774dde7a"
   }
 }
