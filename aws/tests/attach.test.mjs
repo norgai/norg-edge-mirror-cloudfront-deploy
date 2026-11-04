@@ -356,27 +356,44 @@ test("the gate's carve-outs are the dynamic group only, all without functions", 
 
 test("the stack is deployed with values from the distribution, and the mirror token never reaches it", () => {
   const args = deployArgs(GATE_OPTIONS, "customer-origin");
-  assert.ok(args.includes("SiteId=site-1"));
-  assert.ok(args.includes("DistributionId=E123"));
-  assert.ok(args.includes("CustomerOriginId=customer-origin"));
-  assert.ok(args.includes("--no-fail-on-empty-changeset"), "re-running with nothing to change is not an error");
+  assert.ok(args.includes("ParameterKey=SiteId,ParameterValue=site-1"));
+  assert.ok(args.includes("ParameterKey=DistributionId,ParameterValue=E123"));
+  assert.ok(args.includes("ParameterKey=CustomerOriginId,ParameterValue=customer-origin"));
   assert.equal(args.join(" ").includes("nmt_secret_token"), false, "a token in a stack parameter is readable with describe-stacks");
-  assert.equal(args.at(args.indexOf("--template-file") + 1).endsWith("attach-gate.yaml"), true);
+  const body = args.at(args.indexOf("--template-body") + 1);
+  assert.ok(body.startsWith("file://") && body.endsWith("attach-gate.yaml"), "inline, so nothing needs to be in S3");
 });
 
 test("GateVersion is always passed, or an upgrade keeps reporting the old version", () => {
-  // `aws cloudformation deploy` keeps a parameter's previous value when omitted.
-  assert.ok(deployArgs(GATE_OPTIONS, "o").includes(`GateVersion=${GATE_VERSION}`));
+  assert.ok(deployArgs(GATE_OPTIONS, "o", true).includes(`ParameterKey=GateVersion,ParameterValue=${GATE_VERSION}`));
+});
+
+test("the stack is made with create-stack and update-stack, never change sets", () => {
+  // Found on a live install: `cloudformation deploy` needs CreateChangeSet, which
+  // the installer policy does not grant.
+  assert.equal(deployArgs(GATE_OPTIONS, "o")[1], "create-stack");
+  assert.equal(deployArgs(GATE_OPTIONS, "o", true)[1], "update-stack");
+});
+
+test("an update keeps what was not asked for, or a test site would move to the production receptionist", () => {
+  // update-stack resets an omitted parameter to its default.
+  const update = deployArgs(GATE_OPTIONS, "o", true);
+  for (const key of ["ReceptionistHost", "NorgEnvironment", "ReceptionistOriginId", "AlarmTopicArn"]) {
+    assert.ok(update.includes(`ParameterKey=${key},UsePreviousValue=true`), key);
+  }
+  const asked = deployArgs({ ...GATE_OPTIONS, receptionistHost: "h.example.com" }, "o", true);
+  assert.ok(asked.includes("ParameterKey=ReceptionistHost,ParameterValue=h.example.com"));
+  assert.equal(deployArgs(GATE_OPTIONS, "o").some((a) => a.includes("UsePreviousValue")), false, "a new stack has nothing to keep");
 });
 
 test("optional stack parameters are passed only when asked for", () => {
-  assert.equal(deployArgs(GATE_OPTIONS, "o").some((a) => /^(NorgEnvironment|AlarmTopicArn|ReceptionistOriginId)=/.test(a)), false);
+  assert.equal(deployArgs(GATE_OPTIONS, "o").some((a) => /ParameterKey=(NorgEnvironment|AlarmTopicArn|ReceptionistOriginId)/.test(a)), false);
   const args = deployArgs({ ...GATE_OPTIONS, environment: "test", alarmTopicArn: "arn:t", receptionistOriginId: "norg-rx" }, "o");
-  for (const expected of ["NorgEnvironment=test", "AlarmTopicArn=arn:t", "ReceptionistOriginId=norg-rx"]) assert.ok(args.includes(expected), expected);
+  for (const expected of ["NorgEnvironment,ParameterValue=test", "AlarmTopicArn,ParameterValue=arn:t", "ReceptionistOriginId,ParameterValue=norg-rx"]) assert.ok(args.includes(`ParameterKey=${expected}`), expected);
 });
 
 test("the stack is named per distribution unless the caller names it", () => {
-  assert.equal(stackName({ distributionId: "E123" }), "norg-gate-E123");
+  assert.equal(stackName({ distributionId: "E123" }), "norg-edge-gate-E123");
   assert.equal(stackName({ distributionId: "E123", stack: "mine" }), "mine");
 });
 
@@ -385,7 +402,7 @@ test("an install without a site id is refused before anything is deployed", () =
 });
 
 test("a dry run with no stack yet plans what --apply would create", () => {
-  const missing = () => { throw new Error("Stack with id norg-gate-E123 does not exist"); };
+  const missing = () => { throw new Error("Stack with id norg-edge-gate-E123 does not exist"); };
   const outputs = plannedOutputs(GATE_OPTIONS, "customer-origin", missing);
   assert.match(outputs.FunctionArn, /created on --apply/);
   const config = distributionConfig();
@@ -445,4 +462,55 @@ test("--layout gate still works for old runbooks; --layout lambda says it is gon
 test("unknown and retired arguments are rejected, not silently accepted", () => {
   assert.throws(() => parseArgs(["--yolo"]), /unknown argument/);
   assert.throws(() => parseArgs(["--cache-policy=keep"]), /unknown argument/);
+});
+
+// ---------------------------------------------------------------------------
+// Found by running the installer on cloudfront.foxx.ai.
+// ---------------------------------------------------------------------------
+
+test("the default stack name is under norg-edge-*, the only prefix an installer policy allows", () => {
+  assert.match(stackName({ distributionId: "E123" }), /^norg-edge-/);
+});
+
+test("a test site can name its receptionist, in the stack and in the dry run", () => {
+  const options = { ...GATE_OPTIONS, receptionistHost: "edge-content.test.norgai.net" };
+  assert.ok(deployArgs(options, "o").includes("ParameterKey=ReceptionistHost,ParameterValue=edge-content.test.norgai.net"));
+  assert.equal(deployArgs(GATE_OPTIONS, "o").some((a) => a.includes("ReceptionistHost")), false, "the template default applies");
+  const missing = () => { throw new Error("does not exist"); };
+  assert.equal(plannedOutputs(options, "o", missing).ReceptionistHost, "edge-content.test.norgai.net");
+  assert.equal(plannedOutputs(options, "o", () => GATE_OUTPUTS).ReceptionistHost, "edge-content.test.norgai.net");
+  assert.equal(plannedOutputs(GATE_OPTIONS, "o", () => GATE_OUTPUTS).ReceptionistHost, GATE_OUTPUTS.ReceptionistHost);
+});
+
+test("every asset carve-out an old install wrote is recognised, not just some of them", () => {
+  // new-distribution.yaml wrote more suffixes than the CLI did. Recognising only
+  // the CLI's removed 12 of 32 and called the other 20 the customer's.
+  const config = distributionConfig();
+  const noFunctions = { LambdaFunctionAssociations: { Quantity: 0, Items: [] }, FunctionAssociations: { Quantity: 0, Items: [] } };
+  const items = ["*.mjs", "*.jpeg", "*.webmanifest", "*.css"].map((PathPattern) => ({ PathPattern, TargetOriginId: "customer-origin", ...noFunctions }));
+  config.CacheBehaviors = { Quantity: items.length, Items: items };
+  for (const b of items) assert.ok(isOurs(b, config), b.PathPattern);
+  const changes = attachGate(config, GATE_OUTPUTS, GATE_OPTIONS);
+  assert.deepEqual(config.CacheBehaviors.Items.map((b) => b.PathPattern), DYNAMIC_ROUTE_EXCLUSIONS);
+  assert.ok(changes.some((c) => /-4 old MCP and static carve-outs/.test(c)), "the dry run must say what it removes");
+});
+
+test("removing asset carve-outs warns when the default behaviour would leave assets uncached", () => {
+  const warning = (changes) => changes.some((c) => /static assets will stop being cached/.test(c));
+  assert.ok(warning(attachGate(lambdaLayoutInstall(), GATE_OUTPUTS, GATE_OPTIONS)), "the Lambda layout left CachingDisabled");
+
+  const cached = lambdaLayoutInstall();
+  cached.DefaultCacheBehavior.CachePolicyId = "their-cache-policy";
+  assert.equal(warning(attachGate(cached, GATE_OUTPUTS, GATE_OPTIONS)), false);
+  assert.equal(warning(attachGate(distributionConfig(), GATE_OUTPUTS, GATE_OPTIONS)), false, "nothing removed, nothing to warn about");
+});
+
+test("a carve-out carries the fields UpdateDistribution requires", () => {
+  // Found on a live install: "The parameter SmoothStreaming flag is missing."
+  for (const b of carveOutBehaviours("origin")) {
+    assert.equal(b.SmoothStreaming, false, b.PathPattern);
+    assert.equal(b.FieldLevelEncryptionId, "", b.PathPattern);
+    assert.deepEqual(b.TrustedSigners, { Enabled: false, Quantity: 0 }, b.PathPattern);
+    assert.deepEqual(b.TrustedKeyGroups, { Enabled: false, Quantity: 0 }, b.PathPattern);
+  }
 });
