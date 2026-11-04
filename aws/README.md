@@ -3,7 +3,7 @@
 Install NORG's edge-mirroring router on **your own** CloudFront distribution.
 Everything runs in your AWS account; NORG never receives AWS credentials.
 
-This is the CloudFront port of the Cloudflare Worker in the root of this repo.
+This is the CloudFront port of NORG's Cloudflare Worker.
 Same product, same rules, same NORG back-channel — but AWS is a different
 platform, and some of the differences are visible to you. They are listed in
 [Differences from the Cloudflare install](#differences-from-the-cloudflare-install),
@@ -62,7 +62,7 @@ distribution itself is global either way.
 - [ ] **The artifact location NORG gives you** — S3 bucket, object keys, and
       (recommended) object versions. These parameters have **no defaults on
       purpose**: S3 bucket names are globally unique across all AWS accounts and
-      this repository is public, so a default naming a bucket could be claimed
+      these templates go to every customer, so a default naming a bucket could be claimed
       by someone else and would install their code into your account. Verify the
       bucket NORG names is one they own, or mirror the objects into your own
       bucket and point the parameters at that — which is fully supported and the
