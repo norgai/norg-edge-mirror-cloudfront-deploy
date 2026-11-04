@@ -1,7 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
-# NORG Edge Gate — the no-Lambda layout, for a site ALREADY served through
-# CloudFront.
+# NORG Edge Gate — for a site ALREADY served through CloudFront.
 #
 # MUST be launched in us-east-1: the alarms read AWS/CloudFront metrics, which
 # CloudWatch publishes only there.
@@ -25,12 +24,12 @@ AWSTemplateFormatVersion: "2010-09-09"
 # for anyone else, so an unrecognised client ends at your origin. Humans never
 # reach NORG code, so your HTML caching is left exactly as you have it.
 #
-# Like attach-existing.yaml, this stack does not touch your distribution:
-# CloudFormation cannot modify a resource it does not own. Attaching is the
-# second, explicit step —
+# This stack does not touch your distribution: CloudFormation cannot modify a
+# resource it does not own. The install command deploys this stack and then
+# edits the distribution in one step —
 #
-#   node aws/install/attach.mjs --layout gate --distribution-id EXXXXXXXXXXXX \
-#        --stack <this stack> --origin-headers "X-Norg-Site-Id=...,X-Norg-Mirror-Token=..."
+#   node aws/install/attach.mjs --distribution-id EXXXXXXXXXXXX \
+#        --origin-headers "X-Norg-Site-Id=...,X-Norg-Mirror-Token=..." --apply
 #
 # — which adds the receptionist origin, associates the function on the default
 # behaviour, and adds the dynamic carve-outs (/api/*, /wp-*, /cart*, /checkout*

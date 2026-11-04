@@ -1,46 +1,36 @@
 /**
- * Attach (or detach) the NORG edge router on an EXISTING CloudFront distribution.
+ * Install (or remove) the NORG edge gate on an EXISTING CloudFront distribution.
  *
  * Usage:
- *   node aws/install/attach.mjs --distribution-id E123 --stack norg-edge [--apply]
- *   node aws/install/attach.mjs --distribution-id E123 --stack norg-edge --detach --apply
- *   node aws/install/attach.mjs --layout gate --distribution-id E123 --stack norg-gate \
- *        --origin-headers "X-Norg-Site-Id=<id>,X-Norg-Mirror-Token=<token>" [--apply]
- *   node aws/install/attach.mjs --layout gate --distribution-id E123 --detach --apply
+ *   node aws/install/attach.mjs --distribution-id E123 \
+ *        --origin-headers "X-Norg-Site-Id=<id>,X-Norg-Mirror-Token=<token>" [--apply] [--yes]
+ *   node aws/install/attach.mjs --distribution-id E123 --detach [--apply] [--yes]
  *
- * CloudFormation cannot modify a distribution it does not own, so this is the
- * second step after deploying aws/cloudformation/attach-existing.yaml (the
- * Lambda layout, the default) or aws/cloudformation/attach-gate.yaml
- * (--layout gate: one CloudFront Function, no Lambda). It reads that stack's
- * outputs, rewrites your live distribution's default cache behaviour, and
- * writes it back with the config's own ETag so a concurrent change fails
- * loudly instead of being clobbered.
+ * One command does the whole install. With --apply it deploys
+ * aws/cloudformation/attach-gate.yaml (one CloudFront Function and its alarms),
+ * then adds NORG's receptionist as an origin, puts the function on
+ * viewer-request, forwards all viewer headers but Host, and adds the dynamic
+ * carve-outs. The stack name and the customer origin are worked out from the
+ * distribution; pass --stack only to choose your own stack name. Running it
+ * again is how an upgrade or a token rotation lands.
  *
- * The gate layout changes less. It adds NORG's receptionist as an origin, puts
- * the function on viewer-request, forwards all viewer headers but Host, and
- * adds the dynamic carve-outs. It leaves your cache policy alone — humans never
- * reach NORG code, so there is no reason to stop caching your HTML — and it
- * writes nothing onto your own origin. The mirror token the receptionist
- * authenticates with is a secret, so it is not a stack parameter: pass it in
- * --origin-headers, or let NORG's API (which does the same edit) inject it.
+ * It leaves your cache policy alone, because humans never reach NORG code. The
+ * mirror token the receptionist authenticates with is a secret, so it is never
+ * a stack parameter: it goes straight onto the receptionist origin.
  *
  * IT IS A DRY RUN UNLESS YOU PASS --apply. It prints exactly what would change
- * and exits.
+ * and exits, creating nothing. --apply asks before changing anything unless you
+ * also pass --yes.
  *
- * Two behaviours are deliberate and worth knowing before you read the code:
+ * A distribution still on the retired Lambda layout (0.6.14 and earlier) is
+ * upgraded in place: our router, its carve-outs and its x-norg-* origin headers
+ * are removed. Those headers matter most, because that router was what stripped
+ * them from each request before it reached your server.
  *
- *  - It REFUSES rather than works around a conflict. An existing origin-request
- *    Lambda@Edge association is someone else's routing decision; silently
- *    replacing it is how an install breaks a site in a way nobody can
- *    attribute. This mirrors how the Cloudflare installer refuses an
- *    overlapping worker route.
- *  - It stops CloudFront caching your HTML. The default behaviour's cache
- *    policy becomes the managed CachingDisabled policy, so every page request
- *    reaches the router and your origin answers it. That is stated in the dry
- *    run, in those words, before you confirm. Asset carve-outs stay cached.
- *  - It reads your Lambda concurrency quota in every region Lambda@Edge runs
- *    in and warns when one is low, because that quota is the one limit that
- *    answers a visitor with a 503. It never refuses on it.
+ * It REFUSES rather than works around a conflict. A viewer-request function or
+ * origin-request Lambda@Edge that is not ours is someone else's routing
+ * decision, and silently replacing it is how an install breaks a site in a way
+ * nobody can attribute.
  *
  * Shells out to the AWS CLI rather than taking an SDK dependency: this repo's
  * build and tests are zero-install, and anyone attaching a distribution already
@@ -50,9 +40,9 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   CLOUDFRONT_BEHAVIOUR_QUOTA,
@@ -64,36 +54,29 @@ import {
   MCP_PATH_PATTERNS,
   PROTECTED_PATH_PREFIXES,
 } from "../../core/exclusions.mjs";
+import { GATE_VERSION } from "../function/build.mjs";
 
 const REGION = "us-east-1";
+const GATE_TEMPLATE = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "cloudformation",
+  "attach-gate.yaml",
+);
 
-// Where Lambda@Edge executes. The router's concurrency in each of these is
-// bounded by that region's Lambda quota, shared with every other Lambda the
-// account runs there.
-const EDGE_REGIONS = [
-  "us-east-1", "us-east-2", "us-west-1", "us-west-2",
-  "ap-south-1", "ap-northeast-1", "ap-northeast-2", "ap-southeast-1", "ap-southeast-2",
-  "eu-central-1", "eu-west-1", "eu-west-2", "sa-east-1",
-];
-const LAMBDA_CONCURRENCY_QUOTA_CODE = "L-B99A9384";
-// Each Lambda@Edge instance serves 10 requests per second, so the regional
-// page-request ceiling is ten times the quota. Below this the warning fires.
-const LOW_CONCURRENCY_QUOTA = 100;
-
-const LAYOUTS = ["lambda", "gate"];
-// Default Id of the receptionist origin in the gate layout; the stack's
-// ReceptionistOriginId output overrides it on attach, --receptionist-origin-id
-// on detach (when the stack may already be gone).
+// Defaults matching attach-gate.yaml. A stack's own outputs override them.
 const DEFAULT_RECEPTIONIST_ORIGIN_ID = "norg-receptionist";
+const DEFAULT_RECEPTIONIST_HOST = "edge-content.norg.ai";
+const DEFAULT_ENVIRONMENT = "production";
 // Our own viewer-request functions, by name: the gate itself and the 0.5.x
 // cache-bucket classifier an old install may have left behind. Either is
 // replaced on attach and removed on detach; anything else is someone else's.
 const OUR_FUNCTION_ARN = /norg-edge-gate|norg-viewer-classifier/;
-// Our own Lambda@Edge router, by name, when there is no stack output to compare
-// against (the gate stack has none). Matches the attach-existing stack's
+// The retired Lambda layout's router, by name: the attach-existing stack's
 // EdgeRouterFunction physical name and the pre-stack manual installs.
 const OUR_LAMBDA_ARN = /EdgeRouter|norg-router/;
 const MIRROR_TOKEN_HEADER = "x-norg-mirror-token";
+const SITE_ID_HEADER = "x-norg-site-id";
 
 /**
  * Parse argv into an options object.
@@ -102,7 +85,7 @@ const MIRROR_TOKEN_HEADER = "x-norg-mirror-token";
  * @returns {Object} Parsed options.
  */
 function parseArgs(argv) {
-  const options = { apply: false, detach: false, layout: "lambda" };
+  const options = { apply: false, detach: false, yes: false };
   for (let i = 0; i < argv.length; i += 1) {
     // Split on the FIRST "=" only: an --origin-headers value is itself a list
     // of name=value pairs.
@@ -113,17 +96,33 @@ function parseArgs(argv) {
     if (flag === "--distribution-id") options.distributionId = next();
     else if (flag === "--stack") options.stack = next();
     else if (flag === "--site-key") options.siteKey = next();
-    else if (flag === "--layout") options.layout = next();
+    else if (flag === "--layout") assertGateLayout(next());
     else if (flag === "--origin-headers") options.originHeaders = next();
     else if (flag === "--receptionist-origin-id") options.receptionistOriginId = next();
+    else if (flag === "--norg-environment") options.environment = next();
+    else if (flag === "--alarm-topic-arn") options.alarmTopicArn = next();
     else if (flag === "--apply") options.apply = true;
     else if (flag === "--detach") options.detach = true;
+    else if (flag === "--yes") options.yes = true;
     else throw new Error(`unknown argument: ${argv[i]}`);
   }
-  if (!LAYOUTS.includes(options.layout)) {
-    throw new Error(`--layout must be one of ${LAYOUTS.join(", ")}, not "${options.layout}"`);
-  }
   return options;
+}
+
+/**
+ * Accept the old `--layout gate` so existing runbooks keep working, and refuse
+ * anything else with a reason: an operator asking for Lambda must find out it
+ * is gone rather than silently get something else.
+ *
+ * @param {string} layout The requested layout.
+ * @returns {void}
+ */
+function assertGateLayout(layout) {
+  if (layout === "gate") return;
+  throw new Error(
+    `--layout ${layout} is not available: gate is the only layout since 0.6.15. ` +
+      "The Lambda layout was removed; drop --layout.",
+  );
 }
 
 /**
@@ -137,12 +136,13 @@ function aws(args, region = REGION) {
   const output = execFileSync("aws", [...args, "--region", region, "--output", "json"], {
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
   });
   return output.trim() ? JSON.parse(output) : {};
 }
 
 /**
- * Read the attach-existing stack's outputs.
+ * Read a stack's outputs.
  *
  * @param {string} stack Stack name.
  * @returns {Object} Outputs keyed by output name.
@@ -152,152 +152,6 @@ function stackOutputs(stack) {
   const outputs = {};
   for (const output of Stacks[0].Outputs || []) outputs[output.OutputKey] = output.OutputValue;
   return outputs;
-}
-
-/**
- * Is this ARN the same Lambda function, ignoring the version suffix?
- *
- * A published version ARN ends in ":7"; the same function at a different
- * version is still the same function, which is what makes re-attaching after a
- * router upgrade or a key rotation distinguishable from a stranger's install.
- *
- * @param {string} a First function ARN.
- * @param {string} b Second function ARN.
- * @returns {boolean} True when both name the same function.
- */
-function sameFunction(a, b) {
-  const unversioned = (arn) => String(arn).replace(/:\d+$/, "");
-  return Boolean(a && b) && unversioned(a) === unversioned(b);
-}
-
-/**
- * Refuse to proceed when someone else already owns this distribution's routing.
- *
- * OUR OWN association is not a conflict. Re-attaching is the normal way to move
- * to a new router version or a rotated site key, and refusing it would make
- * every upgrade a manual detach-then-attach against a live distribution.
- *
- * @param {Object} behaviour The default cache behaviour.
- * @param {Object} outputs Stack outputs identifying our own functions.
- * @returns {void}
- */
-function assertNoConflict(behaviour, outputs) {
-  const lambdas = behaviour.LambdaFunctionAssociations?.Items || [];
-  const conflicting = lambdas.find(
-    (item) =>
-      item.EventType === "origin-request" &&
-      !sameFunction(item.LambdaFunctionARN, outputs.EdgeRouterVersionArn),
-  );
-  if (conflicting) {
-    throw new Error(
-      "this distribution already has an origin-request Lambda@Edge function " +
-        `(${conflicting.LambdaFunctionARN}).\n` +
-        "Replacing it would silently take over someone else's routing. Remove it " +
-        "first, or attach to a staging distribution instead.",
-    );
-  }
-}
-
-/**
- * The Lambda concurrency quota in every region Lambda@Edge runs in.
- *
- * Read, never enforced: the operator decides. A region that cannot be read
- * (no permission, no CLI access) reports null rather than failing the attach.
- *
- * @returns {Array<{region: string, value: ?number}>} One entry per region.
- */
-function lambdaConcurrencyQuotas() {
-  return EDGE_REGIONS.map((region) => {
-    try {
-      const { Quota } = aws(
-        ["service-quotas", "get-service-quota", "--service-code", "lambda",
-          "--quota-code", LAMBDA_CONCURRENCY_QUOTA_CODE],
-        region,
-      );
-      return { region, value: typeof Quota?.Value === "number" ? Quota.Value : null };
-    } catch (e) {
-      return { region, value: null };
-    }
-  });
-}
-
-/**
- * Human-readable lines for the quota table, with a warning on low regions.
- *
- * @param {Array<{region: string, value: ?number}>} quotas From lambdaConcurrencyQuotas.
- * @returns {Array<string>} Lines to print.
- */
-function quotaLines(quotas) {
-  const lines = quotas.map(({ region, value }) => {
-    const shown = value === null ? "unreadable" : String(value);
-    const flag = value !== null && value < LOW_CONCURRENCY_QUOTA ? "  <- LOW" : "";
-    return `  ${region.padEnd(16)} ${shown.padStart(6)}${flag}`;
-  });
-  const low = quotas.filter((q) => q.value !== null && q.value < LOW_CONCURRENCY_QUOTA);
-  if (low.length) {
-    lines.push(
-      "",
-      "  Every page request is a Lambda@Edge invocation, and each instance serves",
-      "  10 requests per second: a region's ceiling is 10x its quota, and past it",
-      `  CloudFront answers every page request there with a 503. Request an increase`,
-      `  for quota ${LAMBDA_CONCURRENCY_QUOTA_CODE} (service: lambda) in: ${low.map((q) => q.region).join(", ")}.`,
-    );
-  }
-  return lines;
-}
-
-/**
- * Apply the router to a distribution config, in place.
- *
- * @param {Object} config Distribution config.
- * @param {Object} outputs Stack outputs.
- * @param {Object} options Parsed CLI options.
- * @returns {Array<string>} Human-readable summary of the changes.
- */
-function attach(config, outputs, options) {
-  const behaviour = config.DefaultCacheBehavior;
-  assertNoConflict(behaviour, outputs);
-
-  const changes = [];
-  // IncludeBody is OFF on the default behaviour on purpose: it is set per
-  // association, not per path, and on here it delivers every POST body on the
-  // site into the router's memory. The MCP transport is the one surface that
-  // needs a body, and it gets its own behaviours (below) — the only place
-  // IncludeBody is true.
-  behaviour.LambdaFunctionAssociations = {
-    Quantity: 1,
-    Items: [
-      {
-        EventType: "origin-request",
-        LambdaFunctionARN: outputs.EdgeRouterVersionArn,
-        IncludeBody: false,
-      },
-    ],
-  };
-  changes.push(`origin-request  -> ${outputs.EdgeRouterVersionArn} (IncludeBody off)`);
-
-  // Pages are never cached at the edge. Stated here in the words the operator
-  // reads in the dry run, because it is the one change to their caching.
-  if (behaviour.CachePolicyId !== MANAGED_CACHING_DISABLED_ID) {
-    changes.push(
-      `cache policy    ${behaviour.CachePolicyId} -> CachingDisabled ` +
-        "(HTML is no longer cached at the edge; your origin answers every page request)",
-    );
-    behaviour.CachePolicyId = MANAGED_CACHING_DISABLED_ID;
-  } else {
-    changes.push("cache policy    CachingDisabled (already)");
-  }
-
-  behaviour.OriginRequestPolicyId = outputs.OriginRequestPolicyId;
-  changes.push(`origin request  -> ${outputs.OriginRequestPolicyId}`);
-
-  const origin = config.Origins.Items.find((item) => item.Id === behaviour.TargetOriginId);
-  if (!origin) throw new Error(`no origin matches the default behaviour's TargetOriginId`);
-  setOriginHeaders(origin, outputs, options);
-  changes.push(`origin headers  -> ${origin.Id} (install config, incl. the site key)`);
-
-  changes.push(...addCarveOuts(config, outputs));
-  return changes;
 }
 
 /**
@@ -333,59 +187,93 @@ function isNorgHeader(item) {
 }
 
 /**
- * Write the NORG install config onto an origin as custom headers.
+ * The site id from --origin-headers, which the stack needs as a parameter.
  *
- * This is how config reaches the router: Lambda@Edge supports no environment
- * variables. The router deletes these before the request continues to your
- * server, so the key never reaches your own access logs.
- *
- * @param {Object} origin Origin config, mutated in place.
- * @param {Object} outputs Stack outputs.
  * @param {Object} options Parsed CLI options.
- * @returns {void}
+ * @returns {string} The site id.
  */
-function setOriginHeaders(origin, outputs, options) {
-  // Nothing secret is injected here any more. The site key used to be written
-  // into the distribution at this point, where anyone with
-  // cloudfront:GetDistributionConfig could read it; the stack now publishes
-  // x-norg-secret-arn instead and the key stays in Secrets Manager.
-  const existing = (origin.CustomHeaders?.Items || []).filter((item) => !isNorgHeader(item));
-  const items = [...existing, ...parseHeaderPairs(outputs.OriginCustomHeaders)];
-  origin.CustomHeaders = { Quantity: items.length, Items: items };
+function siteIdFrom(options) {
+  const header = parseHeaderPairs(options.originHeaders).find(
+    (item) => item.HeaderName.toLowerCase() === SITE_ID_HEADER,
+  );
+  if (!header) {
+    throw new Error(
+      `--origin-headers must include ${SITE_ID_HEADER}: the install is named after the site.\n` +
+        'Pass --origin-headers "X-Norg-Site-Id=<id>,X-Norg-Mirror-Token=<token>" as NORG issued them.',
+    );
+  }
+  return header.HeaderValue;
 }
 
 /**
- * Remove the router from a distribution config, in place.
+ * The stack this install uses: the caller's, or one per distribution.
  *
- * @param {Object} config Distribution config.
- * @returns {Array<string>} Human-readable summary of the changes.
+ * @param {Object} options Parsed CLI options.
+ * @returns {string} Stack name.
  */
-function detach(config) {
-  const behaviour = config.DefaultCacheBehavior;
-  behaviour.LambdaFunctionAssociations = { Quantity: 0, Items: [] };
+function stackName(options) {
+  return options.stack || `norg-gate-${options.distributionId}`;
+}
 
-  const keptBehaviours = (config.CacheBehaviors?.Items || []).filter((b) => !isOurs(b, config));
-  config.CacheBehaviors = { Quantity: keptBehaviours.length, Items: keptBehaviours };
-
-  for (const origin of config.Origins.Items) {
-    const kept = (origin.CustomHeaders?.Items || []).filter(
-      (item) => !item.HeaderName.startsWith("x-norg-"),
-    );
-    origin.CustomHeaders = { Quantity: kept.length, Items: kept };
-  }
-
+/**
+ * The `aws cloudformation deploy` arguments for the gate stack.
+ *
+ * Takes only non-secret values, and never --origin-headers wholesale: a token
+ * handed to CloudFormation would sit in the stack's parameter list. GateVersion
+ * is always passed, because deploy keeps a parameter's previous value when it
+ * is left out, so an upgrade would otherwise keep reporting the old version.
+ *
+ * @param {Object} options Parsed CLI options.
+ * @param {string} customerOriginId The default behaviour's origin.
+ * @returns {Array<string>} CLI arguments after `aws`.
+ */
+function deployArgs(options, customerOriginId) {
+  const overrides = [
+    `SiteId=${siteIdFrom(options)}`,
+    `DistributionId=${options.distributionId}`,
+    `CustomerOriginId=${customerOriginId}`,
+    `GateVersion=${GATE_VERSION}`,
+  ];
+  if (options.environment) overrides.push(`NorgEnvironment=${options.environment}`);
+  if (options.receptionistOriginId) overrides.push(`ReceptionistOriginId=${options.receptionistOriginId}`);
+  if (options.alarmTopicArn) overrides.push(`AlarmTopicArn=${options.alarmTopicArn}`);
   return [
-    "origin-request  -> removed",
-    "origin headers  -> x-norg-* removed",
-    "carve-outs      -> removed (yours kept)",
-    "cache policy    CachingDisabled left in place (set your own back if you want HTML cached again)",
+    "cloudformation", "deploy",
+    "--region", REGION,
+    "--stack-name", stackName(options),
+    "--template-file", GATE_TEMPLATE,
+    "--no-fail-on-empty-changeset",
+    "--parameter-overrides", ...overrides,
   ];
 }
 
-const READ_METHODS = { Quantity: 3, Items: ["GET", "HEAD", "OPTIONS"],
-  CachedMethods: { Quantity: 3, Items: ["GET", "HEAD", "OPTIONS"] } };
-const ALL_METHODS = { Quantity: 7, Items: ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"],
-  CachedMethods: { Quantity: 3, Items: ["GET", "HEAD", "OPTIONS"] } };
+/**
+ * What the stack's outputs will be, for a dry run that must create nothing.
+ *
+ * An existing stack's values are used, except the customer origin, because
+ * --apply deploys the stack with the distribution's actual origin. A stack that
+ * does not exist yet gets the values --apply would give it.
+ *
+ * @param {Object} options Parsed CLI options.
+ * @param {string} customerOriginId The default behaviour's origin.
+ * @param {function(string): Object} read Reads a stack's outputs.
+ * @returns {Object} Outputs for attachGate.
+ */
+function plannedOutputs(options, customerOriginId, read = stackOutputs) {
+  try {
+    return { ...read(stackName(options)), CustomerOriginId: customerOriginId };
+  } catch (error) {
+    if (!/does not exist/i.test(`${error.message} ${error.stderr || ""}`)) throw error;
+  }
+  const siteId = siteIdFrom(options);
+  return {
+    FunctionArn: `(created on --apply: norg-edge-gate-${siteId})`,
+    ReceptionistHost: DEFAULT_RECEPTIONIST_HOST,
+    ReceptionistOriginId: options.receptionistOriginId || DEFAULT_RECEPTIONIST_ORIGIN_ID,
+    CustomerOriginId: customerOriginId,
+    OriginCustomHeaders: `${SITE_ID_HEADER}=${siteId}, x-norg-env=${options.environment || DEFAULT_ENVIRONMENT}`,
+  };
+}
 
 /**
  * Refuse a carve-out that would shadow a path NORG serves itself.
@@ -402,59 +290,34 @@ function assertDoesNotShadowNorg(pattern) {
   if (clash) {
     throw new Error(
       `carve-out "${pattern}" shadows NORG-served path "${clash}" — ` +
-        "CloudFront would stop invoking the router for it",
+        "CloudFront would stop running the gate for it",
     );
   }
 }
 
+const ALL_METHODS = { Quantity: 7, Items: ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"],
+  CachedMethods: { Quantity: 3, Items: ["GET", "HEAD", "OPTIONS"] } };
+
 /**
- * The behaviours the router adds, in match order (first match wins).
+ * The behaviours the gate adds: the dynamic paths, straight to the origin.
  *
- * Lambda layout:
- *  1. MCP paths — the full router, never cached, and the ONLY place
- *     IncludeBody is on.
- *  2. Dynamic paths — no Lambda, NO cache (managed CachingDisabled), every
- *     method allowed. A 24 h TTL on /cart would serve one visitor's page to
- *     the next, so these must not share the static policy.
- *  3. Static assets — no Lambda, cached. Framework prefixes before bare
- *     suffixes, since prefix patterns are the more specific.
+ * Not cached (a 24 h TTL on /cart would serve one visitor's page to the next)
+ * and every method allowed, because an origin group never fails a POST over and
+ * these are the paths that take them. There are no MCP carve-outs, because the
+ * gate treats MCP descriptors as NORG surfaces itself, and no static ones,
+ * because the function returns a static path untouched for next to nothing.
  *
- * Gate layout: group 2 only. The MCP carve-outs go — the gate treats MCP
- * descriptors as NORG surfaces itself, and a carve-out forwarding the viewer's
- * Host broke on origins that reject it (seen on NORG's own test site). The
- * static carve-outs go too: the function returns a static path untouched for
- * next to nothing, and imposing a cache policy on a customer's assets is not a
- * change the gate needs. The dynamic group stays because an origin group never
- * fails a POST over, and these are the paths that take them.
- *
- * @param {Object} outputs Stack outputs (policy ids and function ARNs).
  * @param {string} targetOriginId Origin the default behaviour points at.
- * @param {string} layout "lambda" or "gate".
  * @returns {Array<Object>} Behaviour items in match order.
  */
-function carveOutBehaviours(outputs, targetOriginId, layout = "lambda") {
-  const base = (PathPattern) => ({
-    PathPattern,
-    TargetOriginId: targetOriginId,
-    ViewerProtocolPolicy: "redirect-to-https",
-    Compress: true,
-  });
-  const mcp = MCP_PATH_PATTERNS.map((pattern) => ({
-    ...base(pattern),
-    AllowedMethods: ALL_METHODS,
-    CachePolicyId: MANAGED_CACHING_DISABLED_ID,
-    OriginRequestPolicyId: outputs.OriginRequestPolicyId,
-    LambdaFunctionAssociations: {
-      Quantity: 1,
-      Items: [
-        { EventType: "origin-request", LambdaFunctionARN: outputs.EdgeRouterVersionArn, IncludeBody: true },
-      ],
-    },
-  }));
-  const dynamic = DYNAMIC_ROUTE_EXCLUSIONS.map((pattern) => {
+function carveOutBehaviours(targetOriginId) {
+  return DYNAMIC_ROUTE_EXCLUSIONS.map((pattern) => {
     assertDoesNotShadowNorg(pattern);
     return {
-      ...base(pattern),
+      PathPattern: pattern,
+      TargetOriginId: targetOriginId,
+      ViewerProtocolPolicy: "redirect-to-https",
+      Compress: true,
       AllowedMethods: ALL_METHODS,
       CachePolicyId: MANAGED_CACHING_DISABLED_ID,
       OriginRequestPolicyId: MANAGED_ALL_VIEWER_EXCEPT_HOST_ORIGIN_REQUEST_ID,
@@ -462,48 +325,40 @@ function carveOutBehaviours(outputs, targetOriginId, layout = "lambda") {
       FunctionAssociations: { Quantity: 0, Items: [] },
     };
   });
-  const statics = [
-    ...DEFAULT_ROUTE_EXCLUSIONS,
-    ...CURATED_ASSET_SUFFIXES.map((suffix) => `*${suffix}`),
-  ].map((pattern) => {
-    assertDoesNotShadowNorg(pattern);
-    return {
-      ...base(pattern),
-      AllowedMethods: READ_METHODS,
-      CachePolicyId: outputs.StaticCachePolicyId,
-      LambdaFunctionAssociations: { Quantity: 0, Items: [] },
-      FunctionAssociations: { Quantity: 0, Items: [] },
-    };
-  });
-  if (layout === "gate") return dynamic;
-  return [...mcp, ...dynamic, ...statics];
 }
 
+// Every pattern an install of ours has ever written, including the retired
+// Lambda layout's MCP and static carve-outs, so an upgrade or detach removes them.
+const OUR_PATTERNS = new Set([
+  ...MCP_PATH_PATTERNS,
+  ...DYNAMIC_ROUTE_EXCLUSIONS,
+  ...DEFAULT_ROUTE_EXCLUSIONS,
+  ...CURATED_ASSET_SUFFIXES.map((suffix) => `*${suffix}`),
+]);
+
 /**
- * Is this behaviour one attach() wrote, as opposed to the customer's own?
+ * Is this behaviour one an install of ours wrote, not the customer's own?
  *
  * There is no tag field on a cache behaviour, so ours are recognised by shape.
  * Every one of ours points at the default behaviour's origin; a behaviour on a
  * different origin is never ours, which is the case that matters (their API
- * lives there). Beyond that: an MCP behaviour is ours if it runs our router; a
- * dynamic one if it carries the managed CachingDisabled + AllViewer pair with
+ * lives there). Beyond that: an MCP behaviour is ours if it runs our old router;
+ * a dynamic one if it carries the managed CachingDisabled + AllViewer pair with
  * no Lambda; a static one if it has no functions at all. A customer's own
  * function-free `*.css` behaviour on the same origin is indistinguishable and
  * would be treated as ours — a known limit, stated in the README.
  *
  * @param {Object} behaviour A CacheBehaviors item.
  * @param {Object} config Distribution config (for the default origin).
- * @returns {boolean} True when attach() would have written this.
+ * @returns {boolean} True when an install of ours would have written this.
  */
 function isOurs(behaviour, config) {
-  if (!behaviour) return false;
-  const patterns = new Set(carveOutBehaviours({}, "").map((b) => b.PathPattern));
-  if (!patterns.has(behaviour.PathPattern)) return false;
+  if (!behaviour || !OUR_PATTERNS.has(behaviour.PathPattern)) return false;
   if (behaviour.TargetOriginId !== config.DefaultCacheBehavior.TargetOriginId) return false;
 
   const lambdas = behaviour.LambdaFunctionAssociations?.Items || [];
   if (MCP_PATH_PATTERNS.includes(behaviour.PathPattern)) {
-    return lambdas.some((l) => /EdgeRouter|norg-router/.test(String(l.LambdaFunctionARN)));
+    return lambdas.some((l) => OUR_LAMBDA_ARN.test(String(l.LambdaFunctionARN)));
   }
   if (lambdas.length || behaviour.FunctionAssociations?.Items?.length) return false;
   if (DYNAMIC_ROUTE_EXCLUSIONS.includes(behaviour.PathPattern)) {
@@ -521,33 +376,19 @@ function isOurs(behaviour, config) {
  * Their behaviour budget is theirs; silently spending the last of it is the
  * kind of change that surfaces weeks later as "we cannot add a behaviour".
  *
+ * A behaviour the customer already has for one of our patterns is THEIRS and
+ * stays exactly as it is. This matters most for /api/*, which very often points
+ * at a different origin: replacing it would repoint their API at their web server.
+ *
  * @param {Object} config Distribution config, mutated in place.
- * @param {Object} outputs Stack outputs.
- * @param {string} layout "lambda" or "gate".
  * @returns {Array<string>} Summary lines.
  */
-function addCarveOuts(config, outputs, layout = "lambda") {
-  const behaviour = config.DefaultCacheBehavior;
+function addCarveOuts(config) {
   const existing = config.CacheBehaviors?.Items || [];
-  const wanted = carveOutBehaviours(outputs, behaviour.TargetOriginId, layout);
-
-  // A behaviour the customer already has for one of our patterns is THEIRS,
-  // and it stays exactly as it is. This matters most for /api/*, which very
-  // often points at a different origin: replacing it with ours would repoint
-  // their API at their web server. Their behaviour already carries no router,
-  // which is all a carve-out is for — except the MCP paths, where the router
-  // is the point, so a collision there is refused rather than skipped.
-  const theirPatterns = new Set(existing.map((b) => b.PathPattern));
-  const mcp = new Set(MCP_PATH_PATTERNS);
-  const collidingMcp = wanted.find((b) => mcp.has(b.PathPattern) && theirPatterns.has(b.PathPattern) && !isOurs(existing.find((e) => e.PathPattern === b.PathPattern), config));
-  if (collidingMcp) {
-    throw new Error(
-      `this distribution already has a cache behaviour for "${collidingMcp.PathPattern}", ` +
-        "which the MCP transport needs the router on. Remove or rename yours first.",
-    );
-  }
-  const ours = wanted.filter((b) => !theirPatterns.has(b.PathPattern) || isOurs(existing.find((e) => e.PathPattern === b.PathPattern), config));
+  const wanted = carveOutBehaviours(config.DefaultCacheBehavior.TargetOriginId);
   const theirs = existing.filter((b) => !isOurs(b, config));
+  const theirPatterns = new Set(theirs.map((b) => b.PathPattern));
+  const ours = wanted.filter((b) => !theirPatterns.has(b.PathPattern));
   const skipped = wanted.length - ours.length;
 
   const total = theirs.length + ours.length + 1; // +1 for the default behaviour
@@ -556,8 +397,7 @@ function addCarveOuts(config, outputs, layout = "lambda") {
       `this distribution has ${theirs.length} cache behaviours; adding ${ours.length} ` +
         `carve-outs would reach ${total}, over CloudFront's limit of ` +
         `${CLOUDFRONT_BEHAVIOUR_QUOTA}.\nRequest a quota increase, or remove some ` +
-        "behaviours first — the router works without the carve-outs, they only " +
-        "stop it being invoked for static assets.",
+        "behaviours first.",
     );
   }
 
@@ -565,11 +405,8 @@ function addCarveOuts(config, outputs, layout = "lambda") {
   // broad customer behaviour listed above them would swallow the carve-outs.
   const items = [...ours, ...theirs];
   config.CacheBehaviors = { Quantity: items.length, Items: items };
-  const groups = layout === "gate"
-    ? "dynamic no-cache, straight to your origin on every method; no MCP or static carve-outs"
-    : `${MCP_PATH_PATTERNS.length} MCP with the router, ${DYNAMIC_ROUTE_EXCLUSIONS.length} dynamic no-cache, the rest static`;
   return [
-    `behaviours      +${ours.length} (${groups})` +
+    `behaviours      +${ours.length} (dynamic no-cache, straight to your origin on every method; no MCP or static carve-outs)` +
       (skipped ? `, ${skipped} skipped because you already have them` : "") +
       ` — ${theirs.length} of yours kept, ${total}/${CLOUDFRONT_BEHAVIOUR_QUOTA} used`,
   ];
@@ -606,12 +443,11 @@ function associateGate(behaviour, functionArn) {
 }
 
 /**
- * Take the Lambda layout's router off the default behaviour, if it is there.
+ * Take the retired Lambda layout's router off the default behaviour.
  *
- * Ours goes, because the gate replaces it. Someone else's origin-request
- * Lambda is refused for the same reason as in the Lambda layout — it would see
- * the rewritten URI and the origin group, and nobody could attribute what
- * happened next.
+ * Ours goes, because the gate replaces it. Someone else's origin-request Lambda
+ * is refused: it would run under the gate's origin group, and nobody could
+ * attribute what happened next.
  *
  * @param {Object} behaviour The default cache behaviour, mutated in place.
  * @returns {?string} Summary line, or null when there was nothing to remove.
@@ -629,10 +465,34 @@ function removeOurLambda(behaviour) {
         "else's routing is refused. Remove it first.",
     );
   }
+  return dropOurLambda(behaviour);
+}
+
+/**
+ * Remove our Lambda association from a behaviour, keeping any other.
+ *
+ * @param {Object} behaviour A cache behaviour, mutated in place.
+ * @returns {?string} Summary line, or null when there was nothing to remove.
+ */
+function dropOurLambda(behaviour) {
+  const items = behaviour.LambdaFunctionAssociations?.Items || [];
   const kept = items.filter((item) => !OUR_LAMBDA_ARN.test(String(item.LambdaFunctionARN)));
   const removed = items.length - kept.length;
   behaviour.LambdaFunctionAssociations = { Quantity: kept.length, Items: kept };
   return removed ? `lambda          -> removed ${removed} NORG Lambda@Edge association(s) left by the Lambda layout` : null;
+}
+
+/**
+ * Remove x-norg-* headers from an origin, keeping the customer's own.
+ *
+ * @param {Object} origin An Origin item, mutated in place.
+ * @returns {number} How many headers were removed.
+ */
+function stripNorgHeaders(origin) {
+  const items = origin.CustomHeaders?.Items || [];
+  const kept = items.filter((item) => !isNorgHeader(item));
+  origin.CustomHeaders = { Quantity: kept.length, Items: kept };
+  return items.length - kept.length;
 }
 
 /**
@@ -686,7 +546,78 @@ function receptionistOrigin(outputs, options) {
 }
 
 /**
- * Apply the gate layout to a distribution config, in place.
+ * Refuse stack outputs the gate cannot work with.
+ *
+ * The function's origin group names the customer origin by Id. If the stack was
+ * told a different Id from the one the default behaviour uses, every agent
+ * request would fail at the edge (503) while humans saw nothing wrong.
+ *
+ * @param {Object} behaviour The default cache behaviour.
+ * @param {Object} outputs Stack outputs.
+ * @returns {void}
+ */
+function assertUsableOutputs(behaviour, outputs) {
+  for (const key of ["FunctionArn", "ReceptionistHost", "CustomerOriginId"]) {
+    if (!outputs[key]) throw new Error(`stack output ${key} is missing — is --stack an attach-gate.yaml stack?`);
+  }
+  if (behaviour.TargetOriginId !== outputs.CustomerOriginId) {
+    throw new Error(
+      `the stack's CustomerOriginId is "${outputs.CustomerOriginId}" but the default ` +
+        `behaviour points at "${behaviour.TargetOriginId}". The function would fail over ` +
+        "to an origin that does not exist. Update the stack parameter to match.",
+    );
+  }
+}
+
+/**
+ * Point the default behaviour's origin request policy at the one the gate needs.
+ *
+ * The gate's headers (x-norg-gate, x-norg-ua, x-norg-viewer-ip, the version) are
+ * viewer headers by the time the origin request is built; this managed policy
+ * forwards all of them, every query string and every cookie, and keeps the
+ * origin's own Host — the receptionist's is set by the function.
+ *
+ * @param {Object} behaviour The default cache behaviour, mutated in place.
+ * @returns {string} Summary line.
+ */
+function setOriginRequestPolicy(behaviour) {
+  if (behaviour.OriginRequestPolicyId === MANAGED_ALL_VIEWER_EXCEPT_HOST_ORIGIN_REQUEST_ID) {
+    return "origin request  AllViewerExceptHostHeader (already)";
+  }
+  const previous = behaviour.OriginRequestPolicyId || "(none)";
+  behaviour.OriginRequestPolicyId = MANAGED_ALL_VIEWER_EXCEPT_HOST_ORIGIN_REQUEST_ID;
+  return `origin request  ${previous} -> AllViewerExceptHostHeader ` +
+    "(the gate's headers and the full query string reach the receptionist)";
+}
+
+/**
+ * Put the receptionist on the distribution and clear NORG headers off the rest.
+ *
+ * Headers left on the customer's origin by the retired Lambda layout must go:
+ * that router stripped them from each request, and without it they would reach
+ * the customer's server. Their own headers on that origin are not touched.
+ *
+ * @param {Object} config Distribution config, mutated in place.
+ * @param {Object} receptionist The receptionist Origin item.
+ * @returns {Array<string>} Summary lines.
+ */
+function installReceptionist(config, receptionist) {
+  const all = config.Origins?.Items || [];
+  const origins = all.filter((item) => item.Id !== receptionist.Id);
+  const stripped = origins.reduce((count, origin) => count + stripNorgHeaders(origin), 0);
+  const replaced = origins.length !== all.length;
+  origins.push(receptionist);
+  config.Origins = { Quantity: origins.length, Items: origins };
+  const lines = [
+    `origin          ${replaced ? "~" : "+"}${receptionist.Id} (${receptionist.DomainName}, https-only, ` +
+      `${receptionist.CustomHeaders.Quantity} custom headers incl. the mirror token; nothing is written on your own origin)`,
+  ];
+  if (stripped) lines.push(`origin headers  -> removed ${stripped} x-norg-* header(s) left on your origin by the Lambda layout`);
+  return lines;
+}
+
+/**
+ * Apply the gate to a distribution config, in place.
  *
  * @param {Object} config Distribution config.
  * @param {Object} outputs attach-gate stack outputs.
@@ -695,62 +626,29 @@ function receptionistOrigin(outputs, options) {
  */
 function attachGate(config, outputs, options) {
   const behaviour = config.DefaultCacheBehavior;
-  for (const key of ["FunctionArn", "ReceptionistHost", "CustomerOriginId"]) {
-    if (!outputs[key]) throw new Error(`stack output ${key} is missing — is --stack an attach-gate.yaml stack?`);
-  }
-  // The function's origin group names the customer origin by Id. If the stack
-  // was told a different Id from the one the default behaviour uses, every
-  // agent request would fail at the edge (503) while humans saw nothing wrong.
-  if (behaviour.TargetOriginId !== outputs.CustomerOriginId) {
-    throw new Error(
-      `the stack's CustomerOriginId is "${outputs.CustomerOriginId}" but the default ` +
-        `behaviour points at "${behaviour.TargetOriginId}". The function would fail over ` +
-        "to an origin that does not exist. Update the stack parameter to match.",
-    );
-  }
+  assertUsableOutputs(behaviour, outputs);
   const receptionist = receptionistOrigin(outputs, options);
   if (receptionist.Id === behaviour.TargetOriginId) {
     throw new Error(`the receptionist origin Id "${receptionist.Id}" is your default origin's Id; set ReceptionistOriginId on the stack`);
   }
 
-  const changes = [];
   const lambdaLine = removeOurLambda(behaviour);
-  if (lambdaLine) changes.push(lambdaLine);
-  changes.push(associateGate(behaviour, outputs.FunctionArn));
-
-  // The gate's headers (x-norg-gate, x-norg-ua, x-norg-viewer-ip, the version)
-  // are viewer headers by the time the origin request is built; this managed
-  // policy forwards all of them, every query string and every cookie, and
-  // keeps the origin's own Host — the receptionist's is set by the function.
-  if (behaviour.OriginRequestPolicyId !== MANAGED_ALL_VIEWER_EXCEPT_HOST_ORIGIN_REQUEST_ID) {
-    changes.push(
-      `origin request  ${behaviour.OriginRequestPolicyId || "(none)"} -> AllViewerExceptHostHeader ` +
-        "(the gate's headers and the full query string reach the receptionist)",
-    );
-    behaviour.OriginRequestPolicyId = MANAGED_ALL_VIEWER_EXCEPT_HOST_ORIGIN_REQUEST_ID;
-  } else {
-    changes.push("origin request  AllViewerExceptHostHeader (already)");
-  }
-  changes.push(`cache policy    ${behaviour.CachePolicyId || "(legacy ForwardedValues)"} left as it is — humans never reach NORG code, so your HTML caching is unchanged`);
-
-  const origins = (config.Origins?.Items || []).filter((item) => item.Id !== receptionist.Id);
-  const replaced = origins.length !== (config.Origins?.Items || []).length;
-  origins.push(receptionist);
-  config.Origins = { Quantity: origins.length, Items: origins };
-  changes.push(
-    `origin          ${replaced ? "~" : "+"}${receptionist.Id} (${receptionist.DomainName}, https-only, ` +
-      `${receptionist.CustomHeaders.Quantity} custom headers incl. the mirror token; nothing is written on your own origin)`,
-  );
-
-  changes.push(...addCarveOuts(config, outputs, "gate"));
-  return changes;
+  return [
+    ...(lambdaLine ? [lambdaLine] : []),
+    associateGate(behaviour, outputs.FunctionArn),
+    setOriginRequestPolicy(behaviour),
+    `cache policy    ${behaviour.CachePolicyId || "(legacy ForwardedValues)"} left as it is — humans never reach NORG code, so your HTML caching is unchanged`,
+    ...installReceptionist(config, receptionist),
+    ...addCarveOuts(config),
+  ];
 }
 
 /**
- * Remove the gate layout from a distribution config, in place.
+ * Remove the gate from a distribution config, in place.
  *
  * Reverses attachGate and restores nothing else: the origin request policy
- * stays as attach left it (say so), the cache policy was never touched.
+ * stays as attach left it (say so), the cache policy was never touched. Also
+ * clears a retired Lambda-layout install, so there is one way to uninstall.
  *
  * @param {Object} config Distribution config.
  * @param {Object} options Parsed CLI options (for the receptionist origin Id).
@@ -767,37 +665,130 @@ function detachGate(config, options) {
     (item) => !(item.EventType === "viewer-request" && OUR_FUNCTION_ARN.test(String(item.FunctionARN))),
   );
   behaviour.FunctionAssociations = { Quantity: functions.length, Items: functions };
+  const lambdaLine = dropOurLambda(behaviour);
 
   const keptBehaviours = (config.CacheBehaviors?.Items || []).filter((b) => !isOurs(b, config));
   config.CacheBehaviors = { Quantity: keptBehaviours.length, Items: keptBehaviours };
 
   const origins = (config.Origins?.Items || []).filter((item) => item.Id !== receptionistId);
-  for (const origin of origins) {
-    const kept = (origin.CustomHeaders?.Items || []).filter((item) => !isNorgHeader(item));
-    origin.CustomHeaders = { Quantity: kept.length, Items: kept };
-  }
+  origins.forEach(stripNorgHeaders);
   config.Origins = { Quantity: origins.length, Items: origins };
 
   return [
     "viewer-request  -> NORG gate function removed (your other functions kept)",
+    ...(lambdaLine ? [lambdaLine] : []),
     `origin          -> ${receptionistId} removed; x-norg-* headers removed everywhere`,
     "carve-outs      -> removed (yours kept)",
     "origin request  AllViewerExceptHostHeader left in place (set your own back if you had one)",
-    "cache policy    never changed by the gate layout",
+    "cache policy    never changed by the gate",
   ];
 }
 
 /**
  * Ask the operator to confirm before touching a live distribution.
  *
- * @param {string} distributionId Distribution being changed.
- * @returns {Promise<boolean>} True when the operator typed yes.
+ * @param {Object} options Parsed CLI options.
+ * @returns {Promise<boolean>} True when --yes was passed or the operator typed yes.
  */
-async function confirm(distributionId) {
+async function confirm(options) {
+  if (options.yes) return true;
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await rl.question(`\nApply this to ${distributionId}? (yes/no) `);
+  const answer = await rl.question(`\nApply this to ${options.distributionId}? (yes/no) `);
   rl.close();
   return answer.trim().toLowerCase() === "yes";
+}
+
+/**
+ * Write a distribution config back, guarded by the ETag it was read with.
+ *
+ * The config goes via a file because it exceeds the argv limit. It holds the
+ * mirror token, so the directory goes away either way. --if-match makes a
+ * concurrent change fail loudly rather than being silently overwritten.
+ *
+ * @param {string} distributionId Distribution being changed.
+ * @param {Object} config The new config.
+ * @param {string} etag ETag from the read.
+ * @returns {void}
+ */
+function writeDistribution(distributionId, config, etag) {
+  const dir = mkdtempSync(join(tmpdir(), "norg-edge-"));
+  const file = join(dir, "distribution-config.json");
+  try {
+    writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
+    aws([
+      "cloudfront", "update-distribution",
+      "--id", distributionId,
+      "--if-match", etag,
+      "--distribution-config", `file://${file}`,
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Warn about the site key flag older runbooks pass; it is accepted and ignored.
+ *
+ * @param {Object} options Parsed CLI options, mutated to drop the key.
+ * @returns {void}
+ */
+function warnAboutSiteKey(options) {
+  if (options.siteKey || process.env.NORG_SITE_KEY) {
+    console.error("note: the gate does not use a site key. It authenticates with the mirror token in --origin-headers.");
+  }
+  delete options.siteKey;
+}
+
+/**
+ * Print what is about to change.
+ *
+ * @param {Object} options Parsed CLI options.
+ * @param {Object} config Distribution config.
+ * @param {Array<string>} changes Summary lines.
+ * @returns {void}
+ */
+function printPlan(options, config, changes) {
+  console.log(`\nDistribution ${options.distributionId} (${config.Comment || "no comment"})`);
+  if (!options.detach) console.log(`Stack ${stackName(options)} (created or updated on --apply)`);
+  console.log("Changes:\n");
+  for (const change of changes) console.log(`  ${change}`);
+}
+
+/**
+ * Plan the change, and on --apply confirm and make it.
+ *
+ * @param {Object} options Parsed CLI options.
+ * @returns {Promise<void>} Resolves when the command completes.
+ */
+async function run(options) {
+  const { DistributionConfig: config, ETag: etag } = aws(["cloudfront", "get-distribution-config", "--id", options.distributionId]);
+  const customerOriginId = config.DefaultCacheBehavior.TargetOriginId;
+  const plan = structuredClone(config);
+  const changes = options.detach
+    ? detachGate(plan, options)
+    : attachGate(plan, plannedOutputs(options, customerOriginId), options);
+  printPlan(options, config, changes);
+
+  if (!options.apply) {
+    console.log("\nDry run. Nothing was created or changed. Re-run with --apply to make these changes.");
+    return;
+  }
+  console.log("\nA distribution update takes 5-15 minutes to propagate. So does reverting.");
+  if (!(await confirm(options))) {
+    console.log("Aborted. Nothing was changed.");
+    return;
+  }
+
+  if (options.detach) {
+    writeDistribution(options.distributionId, plan, etag);
+    console.log(`\nDetached. Once the distribution shows Deployed, delete the function's stack:\n  aws cloudformation delete-stack --region ${REGION} --stack-name ${stackName(options)}`);
+    return;
+  }
+  console.log(`\nDeploying stack ${stackName(options)}...`);
+  execFileSync("aws", deployArgs(options, customerOriginId), { stdio: "inherit" });
+  attachGate(config, stackOutputs(stackName(options)), options);
+  writeDistribution(options.distributionId, config, etag);
+  console.log(`\nApplied. Watch rollout with:\n  aws cloudfront get-distribution --id ${options.distributionId} --query 'Distribution.Status'`);
 }
 
 /**
@@ -807,79 +798,9 @@ async function confirm(distributionId) {
  */
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  if (options.siteKey || process.env.NORG_SITE_KEY) {
-    // Accepted and ignored, so an operator following an older runbook is told
-    // why rather than silently installing something that cannot authenticate.
-    console.error(
-      "note: the site key is no longer passed to this CLI. It lives in Secrets Manager;\n" +
-        "      the stack's SiteKey or SecretArn parameter puts it there.",
-    );
-  }
-  delete options.siteKey;
-
-  if (!options.distributionId || (!options.stack && !(options.detach && options.layout === "gate"))) {
-    throw new Error("--distribution-id and --stack are required");
-  }
-
-  const outputs = options.detach ? {} : stackOutputs(options.stack);
-  const current = aws(["cloudfront", "get-distribution-config", "--id", options.distributionId]);
-  const config = current.DistributionConfig;
-
-  const gate = options.layout === "gate";
-  let changes;
-  if (gate) changes = options.detach ? detachGate(config, options) : attachGate(config, outputs, options);
-  else changes = options.detach ? detach(config) : attach(config, outputs, options);
-
-  console.log(`\nDistribution ${options.distributionId} (${config.Comment || "no comment"}) — ${options.layout} layout`);
-  console.log("Default cache behaviour changes:\n");
-  for (const change of changes) console.log(`  ${change}`);
-
-  if (!options.detach && !gate) {
-    console.log("\nLambda concurrency quota per Lambda@Edge region (the 503 ceiling):\n");
-    for (const line of quotaLines(lambdaConcurrencyQuotas())) console.log(line);
-  }
-
-  if (!options.apply) {
-    console.log("\nDry run. Re-run with --apply to make these changes.");
-    return;
-  }
-
-  console.log(
-    gate
-      ? "\nA distribution update takes 5-15 minutes to propagate. So does reverting."
-      : "\nA distribution update takes 5-15 minutes to propagate, and a Lambda@Edge\n" +
-        "replica can take ~30 minutes before it can be deleted. Reverting is slow.",
-  );
-  if (!(await confirm(options.distributionId))) {
-    console.log("Aborted. Nothing was changed.");
-    return;
-  }
-
-  // The CLI has to hand the config to `aws` as a file because it exceeds the
-  // argv limit. It no longer contains a credential, but it is still the
-  // customer's distribution config, so the directory goes away either way.
-  const dir = mkdtempSync(join(tmpdir(), "norg-edge-"));
-  const file = join(dir, "distribution-config.json");
-  try {
-    writeFileSync(file, JSON.stringify(config));
-
-    // --if-match with the config's own ETag: a concurrent change fails loudly
-    // rather than being silently overwritten.
-    aws([
-      "cloudfront",
-      "update-distribution",
-      "--id",
-      options.distributionId,
-      "--if-match",
-      current.ETag,
-      "--distribution-config",
-      `file://${file}`,
-    ]);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-
-  console.log(`\nApplied. Watch rollout with:\n  aws cloudfront get-distribution --id ${options.distributionId} --query 'Distribution.Status'`);
+  warnAboutSiteKey(options);
+  if (!options.distributionId) throw new Error("--distribution-id is required");
+  await run(options);
 }
 
 // Only run when invoked directly, so the pure functions above can be tested.
@@ -892,14 +813,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 
 export {
   addCarveOuts,
-  isOurs,
-  attach,
   attachGate,
   carveOutBehaviours,
-  detach,
+  deployArgs,
   detachGate,
+  isOurs,
   parseArgs,
   parseHeaderPairs,
-  quotaLines,
-  setOriginHeaders,
+  plannedOutputs,
+  stackName,
 };
