@@ -53,6 +53,7 @@ import {
   MANAGED_CACHING_DISABLED_ID,
   MCP_PATH_PATTERNS,
   PROTECTED_PATH_PREFIXES,
+  TEMPLATE_ASSET_SUFFIXES,
 } from "../../core/exclusions.mjs";
 import { GATE_VERSION } from "../function/build.mjs";
 
@@ -99,6 +100,7 @@ function parseArgs(argv) {
     else if (flag === "--layout") assertGateLayout(next());
     else if (flag === "--origin-headers") options.originHeaders = next();
     else if (flag === "--receptionist-origin-id") options.receptionistOriginId = next();
+    else if (flag === "--receptionist-host") options.receptionistHost = next();
     else if (flag === "--norg-environment") options.environment = next();
     else if (flag === "--alarm-topic-arn") options.alarmTopicArn = next();
     else if (flag === "--apply") options.apply = true;
@@ -208,43 +210,103 @@ function siteIdFrom(options) {
 /**
  * The stack this install uses: the caller's, or one per distribution.
  *
+ * Named under norg-edge-* because that is what a least-privilege installer
+ * policy scopes CloudFormation to; any other prefix is refused with AccessDenied.
+ *
  * @param {Object} options Parsed CLI options.
  * @returns {string} Stack name.
  */
 function stackName(options) {
-  return options.stack || `norg-gate-${options.distributionId}`;
+  return options.stack || `norg-edge-gate-${options.distributionId}`;
 }
 
 /**
- * The `aws cloudformation deploy` arguments for the gate stack.
+ * The stack's parameters, in the form create-stack and update-stack take.
  *
  * Takes only non-secret values, and never --origin-headers wholesale: a token
  * handed to CloudFormation would sit in the stack's parameter list. GateVersion
- * is always passed, because deploy keeps a parameter's previous value when it
- * is left out, so an upgrade would otherwise keep reporting the old version.
+ * is always passed, so an upgrade reports the version it installed.
+ *
+ * update-stack resets an omitted parameter to its default, which would silently
+ * move a test site onto the production receptionist. So on an update, anything
+ * not asked for keeps its previous value.
  *
  * @param {Object} options Parsed CLI options.
  * @param {string} customerOriginId The default behaviour's origin.
+ * @param {boolean} update Whether the stack already exists.
+ * @returns {Array<string>} One ParameterKey=... argument per parameter.
+ */
+function stackParameters(options, customerOriginId, update) {
+  const values = {
+    SiteId: siteIdFrom(options),
+    DistributionId: options.distributionId,
+    CustomerOriginId: customerOriginId,
+    GateVersion: GATE_VERSION,
+    NorgEnvironment: options.environment,
+    ReceptionistOriginId: options.receptionistOriginId,
+    ReceptionistHost: options.receptionistHost,
+    AlarmTopicArn: options.alarmTopicArn,
+  };
+  return Object.entries(values).flatMap(([key, value]) => {
+    if (value) return [`ParameterKey=${key},ParameterValue=${value}`];
+    return update ? [`ParameterKey=${key},UsePreviousValue=true`] : [];
+  });
+}
+
+/**
+ * The AWS CLI arguments that create or update the gate stack.
+ *
+ * create-stack and update-stack, not `cloudformation deploy`: deploy works
+ * through change sets, which a least-privilege installer policy does not grant.
+ * The template goes inline, so nothing needs to be in S3.
+ *
+ * @param {Object} options Parsed CLI options.
+ * @param {string} customerOriginId The default behaviour's origin.
+ * @param {boolean} update Whether the stack already exists.
  * @returns {Array<string>} CLI arguments after `aws`.
  */
-function deployArgs(options, customerOriginId) {
-  const overrides = [
-    `SiteId=${siteIdFrom(options)}`,
-    `DistributionId=${options.distributionId}`,
-    `CustomerOriginId=${customerOriginId}`,
-    `GateVersion=${GATE_VERSION}`,
-  ];
-  if (options.environment) overrides.push(`NorgEnvironment=${options.environment}`);
-  if (options.receptionistOriginId) overrides.push(`ReceptionistOriginId=${options.receptionistOriginId}`);
-  if (options.alarmTopicArn) overrides.push(`AlarmTopicArn=${options.alarmTopicArn}`);
+function deployArgs(options, customerOriginId, update = false) {
   return [
-    "cloudformation", "deploy",
-    "--region", REGION,
+    "cloudformation", update ? "update-stack" : "create-stack",
     "--stack-name", stackName(options),
-    "--template-file", GATE_TEMPLATE,
-    "--no-fail-on-empty-changeset",
-    "--parameter-overrides", ...overrides,
+    "--template-body", `file://${GATE_TEMPLATE}`,
+    "--parameters", ...stackParameters(options, customerOriginId, update),
   ];
+}
+
+/**
+ * Is this error AWS saying the stack does not exist?
+ *
+ * @param {Error} error A failed AWS CLI call.
+ * @returns {boolean} True only for a missing stack, never for AccessDenied.
+ */
+function isMissingStack(error) {
+  return /does not exist/i.test(`${error.message} ${error.stderr || ""}`);
+}
+
+/**
+ * Create the gate stack, or update it, and wait until it is finished.
+ *
+ * @param {Object} options Parsed CLI options.
+ * @param {string} customerOriginId The default behaviour's origin.
+ * @returns {void}
+ */
+function deployStack(options, customerOriginId) {
+  let update = true;
+  try {
+    stackOutputs(stackName(options));
+  } catch (error) {
+    if (!isMissingStack(error)) throw error;
+    update = false;
+  }
+  try {
+    aws(deployArgs(options, customerOriginId, update));
+  } catch (error) {
+    // Re-running with nothing to change is normal, and is how a token rotates.
+    if (/No updates are to be performed/.test(`${error.message} ${error.stderr || ""}`)) return;
+    throw error;
+  }
+  aws(["cloudformation", "wait", update ? "stack-update-complete" : "stack-create-complete", "--stack-name", stackName(options)]);
 }
 
 /**
@@ -261,14 +323,19 @@ function deployArgs(options, customerOriginId) {
  */
 function plannedOutputs(options, customerOriginId, read = stackOutputs) {
   try {
-    return { ...read(stackName(options)), CustomerOriginId: customerOriginId };
+    const existing = read(stackName(options));
+    return {
+      ...existing,
+      CustomerOriginId: customerOriginId,
+      ReceptionistHost: options.receptionistHost || existing.ReceptionistHost,
+    };
   } catch (error) {
-    if (!/does not exist/i.test(`${error.message} ${error.stderr || ""}`)) throw error;
+    if (!isMissingStack(error)) throw error;
   }
   const siteId = siteIdFrom(options);
   return {
     FunctionArn: `(created on --apply: norg-edge-gate-${siteId})`,
-    ReceptionistHost: DEFAULT_RECEPTIONIST_HOST,
+    ReceptionistHost: options.receptionistHost || DEFAULT_RECEPTIONIST_HOST,
     ReceptionistOriginId: options.receptionistOriginId || DEFAULT_RECEPTIONIST_ORIGIN_ID,
     CustomerOriginId: customerOriginId,
     OriginCustomHeaders: `${SITE_ID_HEADER}=${siteId}, x-norg-env=${options.environment || DEFAULT_ENVIRONMENT}`,
@@ -318,6 +385,11 @@ function carveOutBehaviours(targetOriginId) {
       TargetOriginId: targetOriginId,
       ViewerProtocolPolicy: "redirect-to-https",
       Compress: true,
+      // Required by UpdateDistribution, which rejects a behaviour without them.
+      SmoothStreaming: false,
+      FieldLevelEncryptionId: "",
+      TrustedSigners: { Enabled: false, Quantity: 0 },
+      TrustedKeyGroups: { Enabled: false, Quantity: 0 },
       AllowedMethods: ALL_METHODS,
       CachePolicyId: MANAGED_CACHING_DISABLED_ID,
       OriginRequestPolicyId: MANAGED_ALL_VIEWER_EXCEPT_HOST_ORIGIN_REQUEST_ID,
@@ -333,7 +405,10 @@ const OUR_PATTERNS = new Set([
   ...MCP_PATH_PATTERNS,
   ...DYNAMIC_ROUTE_EXCLUSIONS,
   ...DEFAULT_ROUTE_EXCLUSIONS,
-  ...CURATED_ASSET_SUFFIXES.map((suffix) => `*${suffix}`),
+  // The attach CLI wrote the curated list, and the new-distribution template the
+  // longer one. Recognising only one would remove some of an install's asset
+  // carve-outs and call the rest the customer's.
+  ...[...CURATED_ASSET_SUFFIXES, ...TEMPLATE_ASSET_SUFFIXES].map((suffix) => `*${suffix}`),
 ]);
 
 /**
@@ -405,11 +480,33 @@ function addCarveOuts(config) {
   // broad customer behaviour listed above them would swallow the carve-outs.
   const items = [...ours, ...theirs];
   config.CacheBehaviors = { Quantity: items.length, Items: items };
+  const wantedPatterns = new Set(wanted.map((b) => b.PathPattern));
+  const retired = existing.filter((b) => isOurs(b, config) && !wantedPatterns.has(b.PathPattern));
   return [
     `behaviours      +${ours.length} (dynamic no-cache, straight to your origin on every method; no MCP or static carve-outs)` +
       (skipped ? `, ${skipped} skipped because you already have them` : "") +
       ` — ${theirs.length} of yours kept, ${total}/${CLOUDFRONT_BEHAVIOUR_QUOTA} used`,
+    ...retiredCarveOutLines(retired, config.DefaultCacheBehavior),
   ];
+}
+
+/**
+ * Say which old carve-outs an upgrade removes, and what that costs.
+ *
+ * Assets then follow the default behaviour, so one left on CachingDisabled stops
+ * caching them. That is the customer's call, and the dry run is where they see it.
+ *
+ * @param {Array<Object>} retired Our old behaviours being removed.
+ * @param {Object} behaviour The default cache behaviour.
+ * @returns {Array<string>} Summary lines.
+ */
+function retiredCarveOutLines(retired, behaviour) {
+  if (!retired.length) return [];
+  const lines = [`behaviours      -${retired.length} old MCP and static carve-outs from the Lambda layout removed`];
+  if (behaviour.CachePolicyId === MANAGED_CACHING_DISABLED_ID) {
+    lines.push("WARNING         your default behaviour is CachingDisabled, so static assets will stop being cached at the edge; set your own cache policy if you want them cached");
+  }
+  return lines;
 }
 
 /**
@@ -785,7 +882,7 @@ async function run(options) {
     return;
   }
   console.log(`\nDeploying stack ${stackName(options)}...`);
-  execFileSync("aws", deployArgs(options, customerOriginId), { stdio: "inherit" });
+  deployStack(options, customerOriginId);
   attachGate(config, stackOutputs(stackName(options)), options);
   writeDistribution(options.distributionId, config, etag);
   console.log(`\nApplied. Watch rollout with:\n  aws cloudfront get-distribution --id ${options.distributionId} --query 'Distribution.Status'`);

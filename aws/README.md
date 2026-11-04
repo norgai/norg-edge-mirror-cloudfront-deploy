@@ -74,7 +74,7 @@ node aws/install/attach.mjs \
 It asks you to confirm, then:
 
 1. Deploys [`attach-gate.yaml`](cloudformation/attach-gate.yaml) as the stack
-   `norg-gate-<distribution-id>`: the function and its two alarms. The origin it
+   `norg-edge-gate-<distribution-id>`: the function and its two alarms. The origin it
    fails over to is read from your default behaviour.
 2. Adds the receptionist origin, associates the function on viewer-request,
    sets the origin request policy, and adds the dynamic carve-outs.
@@ -86,6 +86,7 @@ It asks you to confirm, then:
 | `--stack <name>` | Use your own stack name. |
 | `--norg-environment <production\|test>` | Defaults to `production`. |
 | `--alarm-topic-arn <arn>` | Send the two alarms to an SNS topic. |
+| `--receptionist-host <host>` | Defaults to `edge-content.norg.ai`. Use NORG's test host for a test site. |
 | `--receptionist-origin-id <id>` | Change this only if your distribution already uses `norg-receptionist`. |
 
 **To upgrade or rotate the token,** run the same command again. It updates the
