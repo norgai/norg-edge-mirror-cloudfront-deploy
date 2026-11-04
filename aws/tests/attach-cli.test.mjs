@@ -47,8 +47,17 @@ const verb = args[0] + " " + args[1];
 const stackFile = path.join(dir, "stack-exists");
 if (verb === "cloudfront get-distribution-config") {
   process.stdout.write(fs.readFileSync(path.join(dir, "distribution.json")));
-} else if (verb === "cloudformation deploy") {
+} else if (verb === "cloudformation create-stack") {
   fs.writeFileSync(stackFile, "1");
+  process.stdout.write("{}");
+} else if (verb === "cloudformation update-stack") {
+  if (fs.existsSync(path.join(dir, "no-updates"))) {
+    process.stderr.write("An error occurred (ValidationError): No updates are to be performed.\\n");
+    process.exit(254);
+  }
+  process.stdout.write("{}");
+} else if (verb === "cloudformation wait") {
+  process.exit(0);
 } else if (verb === "cloudformation describe-stacks") {
   if (!fs.existsSync(stackFile)) {
     process.stderr.write("An error occurred (ValidationError): Stack with id x does not exist\\n");
@@ -123,14 +132,16 @@ test("--apply --yes is the whole install: stack first, then the distribution, wi
   assert.deepEqual(calls(), [
     "cloudfront get-distribution-config",
     "cloudformation describe-stacks",
-    "cloudformation deploy",
+    "cloudformation describe-stacks",
+    "cloudformation create-stack",
+    "cloudformation wait",
     "cloudformation describe-stacks",
     "cloudfront update-distribution",
   ]);
   const raw = readFileSync(join(dir, "calls.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  const deploy = raw.find((args) => args[1] === "deploy");
-  assert.ok(deploy.includes("CustomerOriginId=web"), "the origin is read from the distribution, not asked for");
-  assert.ok(deploy.includes("norg-gate-E123"), "the stack name is worked out");
+  const deploy = raw.find((args) => args[1] === "create-stack");
+  assert.ok(deploy.includes("ParameterKey=CustomerOriginId,ParameterValue=web"), "the origin is read from the distribution, not asked for");
+  assert.ok(deploy.includes("norg-edge-gate-E123"), "the stack name is worked out");
   assert.equal(deploy.join(" ").includes("nmt_secret_token"), false, "the token must never reach the stack");
   const update = raw.find((args) => args[1] === "update-distribution");
   assert.equal(update[update.indexOf("--if-match") + 1], "ETAG1", "a concurrent change must fail loudly");
@@ -149,19 +160,31 @@ test("the distribution gets the real function ARN, not the dry run's placeholder
 test("--apply without --yes and no answer changes nothing", () => {
   const result = runCli(["--distribution-id", "E123", "--origin-headers", HEADERS, "--apply"]);
   assert.match(result.stdout, /Apply this to E123\?/);
-  assert.deepEqual(calls().filter((c) => /deploy|update-distribution/.test(c)), []);
+  assert.deepEqual(calls().filter((c) => /create-stack|update-stack|update-distribution/.test(c)), []);
 });
 
 test("--detach needs no stack or headers, and names the stack to delete", () => {
   const result = runCli(["--distribution-id", "E123", "--detach", "--apply", "--yes"]);
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(calls(), ["cloudfront get-distribution-config", "cloudfront update-distribution"]);
-  assert.match(result.stdout, /delete-stack --region us-east-1 --stack-name norg-gate-E123/);
+  assert.match(result.stdout, /delete-stack --region us-east-1 --stack-name norg-edge-gate-E123/);
 });
 
 test("an install with no mirror token stops before anything is deployed", () => {
   const result = runCli(["--distribution-id", "E123", "--origin-headers", `X-Norg-Site-Id=${SITE_ID}`, "--apply", "--yes"]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /x-norg-mirror-token/);
-  assert.deepEqual(calls().filter((c) => /deploy|update-distribution/.test(c)), []);
+  assert.deepEqual(calls().filter((c) => /create-stack|update-stack|update-distribution/.test(c)), []);
+});
+
+test("re-running updates the stack, and having nothing to update still attaches", () => {
+  writeFileSync(join(dir, "stack-exists"), "1");
+  writeFileSync(join(dir, "no-updates"), "1");
+  const result = runCli(["--distribution-id", "E123", "--origin-headers", HEADERS, "--apply", "--yes"]);
+  assert.equal(result.status, 0, result.stderr);
+  const made = calls();
+  assert.ok(made.includes("cloudformation update-stack"));
+  assert.equal(made.includes("cloudformation create-stack"), false);
+  assert.equal(made.includes("cloudformation wait"), false, "nothing is updating, so there is nothing to wait for");
+  assert.equal(made.at(-1), "cloudfront update-distribution", "a token rotation still lands");
 });
