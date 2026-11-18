@@ -7,8 +7,8 @@
  * This repo is the source of truth for the customer-zone edge-router worker.
  * `src/edge-router-worker.js` is a COMMITTED build artifact: it is what the
  * Deploy-to-Cloudflare button deploys (wrangler.jsonc `main`), and what NORG's
- * backend pins by commit SHA + SHA-256 and materialises for API-token installs
- * (content-craft `edge_worker_pin.py` / `sync-edge-router.mjs`). CI rebuilds
+ * backend pins by commit SHA + SHA-256 and materialises for API-token
+ * installs. CI rebuilds
  * it and fails on any diff, so a source edit can never ship without its bundle.
  *
  * Deployment surfaces need ONE self-contained file, so the lib modules are
@@ -33,8 +33,8 @@ const entry = join(here, "workers", "edge-router-worker.js");
 const outfile = join(here, "src", "edge-router-worker.js");
 
 // Names that must NEVER appear in a bundle that ships into a customer's
-// Cloudflare account. Mirrors the deploy-time guard in content-craft's
-// worker_source.py, which refuses to upload a leaking artifact.
+// Cloudflare account. Mirrors NORG's deploy-time guard, which
+// refuses to upload a leaking artifact.
 const FORBIDDEN_NAMES = [
   "CRAWLER_EVENT_SECRET",
   "WORKER_AUTH_SECRET",
