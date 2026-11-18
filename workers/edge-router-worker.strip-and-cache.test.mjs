@@ -104,7 +104,7 @@ test("the strip list never removes content-bearing elements", () => {
 });
 
 test("button is unwrapped, not removed with its content", () => {
-  // Regression: gymshark.com's mobile accordion menu wraps real category
+  // Regression: a retailer's mobile accordion menu wraps real category
   // labels in <h5><button><span>Trending</span></button></h5>. Grouping
   // "button" with script/style/nav in STRIP_REMOVE_SELECTORS deleted the
   // label text too, publishing empty <h5></h5> shells. The wrapper tag is

@@ -183,7 +183,7 @@ function patternsRouteWithPrefix(prefix) {
   ];
 }
 
-/** The feed carrying a per-route skip_paths list (NOR-2849172819). */
+/** The feed carrying a per-route skip_paths list. */
 function patternsRouteWithSkip(skipPaths) {
   return [
     "/api/v1/edge/bot-patterns",
@@ -426,7 +426,7 @@ test("an AI agent gets the NORG render at the customer URL", async () => {
 });
 
 test("a skipped path passes through to origin UNCHANGED even for a diverting AI bot", async () => {
-  // NOR-2849172819 AC #3: an AI-bot UA that would otherwise be served the
+  // AC #3: an AI-bot UA that would otherwise be served the
   // mirror gets the customer's ORIGINAL page (fetch(request)), not serveAgent
   // and not the stripped fallback, when its path is in skip_paths.
   installFetch([
@@ -455,7 +455,7 @@ test("a skipped path passes through to origin UNCHANGED even for a diverting AI 
 });
 
 test("a NON-skipped path still diverts to the mirror (no regression)", async () => {
-  // NOR-2849172819 AC #4: only the listed path passes through; every other
+  // AC #4: only the listed path passes through; every other
   // route is intercepted exactly as before.
   installFetch([
     patternsRouteWithSkip(["/other-page"]),
@@ -1051,7 +1051,7 @@ test("a strip below the word floor serves the untouched origin as origin_thin", 
   assert.notEqual(response.headers.get("X-Norg-Edge"), "stripped");
   const event = calls.find((c) => c.url.includes("/edge/events"));
   assert.equal(JSON.parse(event.init.body).served, "origin_thin");
-  // NOR-2849342414: the real origin status travels with the event.
+  // the real origin status travels with the event.
   assert.equal(JSON.parse(event.init.body).response_status, response.status);
 });
 
@@ -1233,7 +1233,7 @@ test("AC8: the R2 key is derived from the path only — the query string is igno
   assert.equal(mirror.url, "https://r2.norg.test/site-123/products/widget/index.html");
 });
 
-test("NOR-2849342414: a pass-through miss records the origin's REAL status (404), not a path-derived guess", async () => {
+test("a pass-through miss records the origin's REAL status (404), not a path-derived guess", async () => {
   // Before this, the edge worker never sent response_status, so analytics could
   // not tell a served page from a 404 except by looking at the path.
   installFetch([
@@ -1267,7 +1267,7 @@ test("a ?agent=true miss serves the untouched origin, tags it, and enqueues NO r
   assert.equal(response.headers.get("X-Norg-Edge"), null);
   const event = calls.find((c) => c.url.includes("/edge/events"));
   assert.equal(JSON.parse(event.init.body).served, "agent_param_override_miss");
-  assert.equal(typeof JSON.parse(event.init.body).response_status, "number"); // NOR-2849342414
+  assert.equal(typeof JSON.parse(event.init.body).response_status, "number");
   assert.equal(
     calls.filter((c) => c.url.includes("/edge/render-requests")).length,
     0,
@@ -1312,7 +1312,7 @@ test("AC7: a ?agent=true R2 error (503) fails open to the untouched origin", asy
   assert.equal(response.headers.get("X-Norg-Edge"), null);
   const event = calls.find((c) => c.url.includes("/edge/events"));
   assert.equal(JSON.parse(event.init.body).served, "agent_param_override_miss");
-  assert.equal(typeof JSON.parse(event.init.body).response_status, "number"); // NOR-2849342414
+  assert.equal(typeof JSON.parse(event.init.body).response_status, "number");
   // An R2 outage under the override must NOT enqueue a render (same rule as the
   // 404 miss: param-driven traffic never triggers renders).
   assert.equal(
@@ -1932,7 +1932,7 @@ test("agentic hits are tagged distinctly from user-agent diverts", async () => {
   const event = calls.find((c) => c.url.includes("/edge/events"));
   const body = JSON.parse(event.init.body);
   assert.equal(body.served, "agentic_path");
-  assert.equal(body.response_status, 200); // NOR-2849342414
+  assert.equal(body.response_status, 200);
   assert.equal(body.is_ai_bot, false, "a URL hit is not evidence of a bot");
 });
 

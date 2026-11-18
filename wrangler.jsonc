@@ -3,18 +3,14 @@
   //
   // Deployed into the CUSTOMER's Cloudflare account. Read README.md in this
   // directory first. This template is published live at
-  // https://github.com/norgai/norg-edge-mirror-cloudflare-deploy via
-  // `node infrastructure/cloudflare/deploy-template/extract.mjs <dir>` — do
-  // not hand-edit the copy in that repo, regenerate and push instead.
+  // a NORG public repo. The bundle under src/ is generated (`node build.mjs`) —
+  // do not hand-edit it.
   "$schema": "node_modules/wrangler/config-schema.json",
 
   "name": "norg-edge-router",
 
-  // Copied verbatim from the BUILT bundle infrastructure/cloudflare/dist/
-  // edge-router-worker.js by extract.mjs (single file, no imports — produced
-  // by `node infrastructure/cloudflare/build.mjs`). Keep in sync — see
-  // README "Keeping this repo in sync with NORG's worker source";
-  // apps/api/tests/test_edge_worker_asset.py guards the vendored copy.
+  // The BUILT bundle (single file, no imports — produced by `node build.mjs`
+  // from workers/). CI fails if it is out of date.
   "main": "src/edge-router-worker.js",
 
   "compatibility_date": "2026-08-01",
